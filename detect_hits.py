@@ -57,7 +57,11 @@ HIT_REF_HI_SEC = 0.15            # reference window ends this far after shot
 HIT_LOOK_LO_SEC = 0.20           # look for dust/break this far after shot
 HIT_LOOK_HI_SEC = 0.60           # ... up to this far after shot
 HIT_PEAK_MIN = 27.0              # min per-block peak diff vs reference
-HIT_CLUSTER_MIN = 2              # min size of high-diff cluster (blocks)
+HIT_FRAME_HOT_ABS = 12.0         # per-block diff that counts as "lit" in a frame
+HIT_FRAME_HOT_FRAC = 0.4         # ... or this fraction of the shot's peak
+HIT_SPREAD_MIN = 3               # min lit blocks SIMULTANEOUSLY in any frame
+                                 # (a moving intact clay = 1-2 per frame;
+                                 # a break/puff fills 3+ blocks at once)
 HIT_UPPER_FRACTION = 5 / 9       # only score the top 5/9 of the frame
                                  # (clays/hill); bottom rows fire on
                                  # camera follow-through after misses
@@ -298,12 +302,18 @@ def classify_shot_as_hit(block_frames, fps, shot_ts):
     """Decide if an audio-detected shot was a hit (clay break visible).
 
     Algorithm: take a reference of the immediate post-shot frames (camera
-    has just settled into recoil pose), then look 200-600ms later for a
-    LOCALIZED brightness change in the upper portion of the frame. A clay
-    break/dust puff produces such a change; a clean miss does not.
+    has just settled into recoil pose), then look 200-600ms later in the
+    upper portion of the frame for a SPATIALLY EXTENDED brightness change
+    -- one that lights up several adjacent blocks at the same instant.
 
-    Returns dict with: is_hit, score (peak block diff), ratio (peak/median),
-    cluster (count of blocks above 0.5*peak), hit_ts (shot_ts + offset of peak).
+    A clay break/dust puff produces a 2-D blob (3+ blocks lit simultaneously
+    in a single frame). A clean miss produces nothing. A moving but intact
+    clay (e.g. a crosser passing through) produces a 1-D streak: only 1-2
+    blocks lit per frame, even though many different blocks light up across
+    the full window. The per-frame spread metric distinguishes these.
+
+    Returns dict with: is_hit, score (peak block diff), spread (max number
+    of lit blocks in any single frame), hit_ts (shot_ts + offset of peak).
     """
     n = len(block_frames)
     if n == 0:
@@ -315,42 +325,43 @@ def classify_shot_as_hit(block_frames, fps, shot_ts):
     la = max(rb, int((shot_ts + HIT_LOOK_LO_SEC) * fps))
     lb = min(n, int((shot_ts + HIT_LOOK_HI_SEC) * fps))
     if rb <= ra or lb <= la:
-        return {"is_hit": False, "score": 0.0, "ratio": 0.0,
-                "cluster": 0, "hit_ts": None}
+        return {"is_hit": False, "score": 0.0, "spread": 0, "hit_ts": None}
 
     ref = block_frames[ra:rb].mean(axis=0)
     look = block_frames[la:lb]
     diff = np.abs(look - ref)             # (T, gy, gx)
-    block_peak = diff.max(axis=0)         # (gy, gx)
 
     # Score only the upper portion (where clays appear); the bottom rows
     # tend to fire on camera follow-through after a miss.
     upper_rows = max(1, int(round(gy * HIT_UPPER_FRACTION)))
-    upper = block_peak[:upper_rows]
+    diff_upper = diff[:, :upper_rows, :]   # (T, upper_rows, gx)
+    block_peak = diff_upper.max(axis=0)
 
-    score = float(upper.max())
-    median = float(np.median(upper))
-    ratio = score / max(median, 0.5)
-    cluster = int((upper > 0.5 * score).sum())
+    score = float(block_peak.max())
 
-    is_hit = (score >= HIT_PEAK_MIN and cluster >= HIT_CLUSTER_MIN)
+    # Per-frame spread: in each frame, how many upper blocks are lit at once?
+    hot_thresh = max(HIT_FRAME_HOT_ABS, HIT_FRAME_HOT_FRAC * score)
+    per_frame_hot = (diff_upper > hot_thresh).sum(axis=(1, 2))   # (T,)
+    spread = int(per_frame_hot.max()) if per_frame_hot.size else 0
+
+    is_hit = (score >= HIT_PEAK_MIN and spread >= HIT_SPREAD_MIN)
 
     # Find the frame inside the look window where peak block was hottest.
     if is_hit:
-        peak_block = np.unravel_index(int(upper.argmax()), upper.shape)
-        per_frame_at_peak = diff[:, peak_block[0], peak_block[1]]
+        peak_block = np.unravel_index(int(block_peak.argmax()), block_peak.shape)
+        per_frame_at_peak = diff_upper[:, peak_block[0], peak_block[1]]
         peak_offset_frames = int(per_frame_at_peak.argmax())
         hit_ts = round(shot_ts + HIT_LOOK_LO_SEC + peak_offset_frames / fps, 2)
     else:
         hit_ts = None
 
-    return {"is_hit": is_hit, "score": score, "ratio": ratio,
-            "cluster": cluster, "hit_ts": hit_ts}
+    return {"is_hit": is_hit, "score": score, "spread": spread,
+            "hit_ts": hit_ts}
 
 
 # -- detect command -----------------------------------------------------------
 
-def cmd_detect(video_dir, detect_type="both"):
+def cmd_detect(video_dir, detect_type="both", clay_type="away", targets=None):
     if not os.path.isdir(video_dir):
         print(f"Error: {video_dir} is not a directory.")
         sys.exit(1)
@@ -390,16 +401,33 @@ def cmd_detect(video_dir, detect_type="both"):
             shots = [(t, r) for t, label, r in audio_detections if label == "SHOT"]
 
         if do_hits and shots:
-            # Patch-based hit/miss test conditioned on each detected shot.
-            block_frames, fps = compute_block_frames(vpath)
-            for shot_ts, _ in shots:
-                res = classify_shot_as_hit(block_frames, fps, shot_ts)
-                if res is None:
-                    continue
-                if res["is_hit"]:
-                    hits.append((shot_ts, res["hit_ts"], res["score"]))
-                else:
-                    misses.append((shot_ts, res["score"]))
+            ct = clay_type
+            if ct == "away":
+                # Block-based detector: best for going-away clays.
+                block_frames, fps = compute_block_frames(vpath)
+                for shot_ts, _ in shots:
+                    res = classify_shot_as_hit(block_frames, fps, shot_ts)
+                    if res is None:
+                        continue
+                    if res["is_hit"]:
+                        hits.append((shot_ts, res["hit_ts"], res["score"],
+                                     res["spread"]))
+                    else:
+                        misses.append((shot_ts, res["score"],
+                                       res["spread"]))
+            else:
+                # Clay-tracking detector: for crossers and incoming.
+                from clay_track import classify_shot, classify_outcome
+                for shot_ts, _ in shots:
+                    metrics = classify_shot(vpath, shot_ts, ct)
+                    decision = classify_outcome(metrics, ct)
+                    score = decision["score"]
+                    if decision["is_hit"]:
+                        hits.append((shot_ts, shot_ts + 0.15,
+                                     round(score * 100, 1), 0))
+                    else:
+                        misses.append((shot_ts,
+                                       round(score * 100, 1), 0))
         elif do_hits and not do_shots:
             print(" -> WARNING: --type hit needs shot context; "
                   "use --type both")
@@ -410,10 +438,10 @@ def cmd_detect(video_dir, detect_type="both"):
                          f"{[f'{t:.1f}s' for t, _ in shots]}")
         if hits:
             parts.append(f"{len(hits)} hit(s) at "
-                         f"{[f'{ht:.1f}s(score={s:.0f})' for _, ht, s in hits]}")
+                         f"{[f'{ht:.1f}s(score={s:.0f},sp={sp})' for _, ht, s, sp in hits]}")
         if misses:
             parts.append(f"{len(misses)} miss(es) at "
-                         f"{[f'{st:.1f}s(score={s:.0f})' for st, s in misses]}")
+                         f"{[f'{st:.1f}s(score={s:.0f},sp={sp})' for st, s, sp in misses]}")
         if parts:
             print(f" -> {'; '.join(parts)}")
         else:
@@ -426,19 +454,21 @@ def cmd_detect(video_dir, detect_type="both"):
         for shot_ts, _ in shots:
             entry = {"file": vname, "timestamp": shot_ts, "type": "shot"}
             # Tag with its hit/miss outcome for downstream analysis.
-            for st, ht, sc in hits:
+            for st, ht, sc, sp in hits:
                 if st == shot_ts:
                     entry["outcome"] = "hit"
                     entry["hit_score"] = round(sc, 1)
+                    entry["hit_spread"] = sp
                     break
             else:
-                for st, sc in misses:
+                for st, sc, sp in misses:
                     if st == shot_ts:
                         entry["outcome"] = "miss"
                         entry["hit_score"] = round(sc, 1)
+                        entry["hit_spread"] = sp
                         break
             results.append(entry)
-        for shot_ts, hit_ts, score in hits:
+        for shot_ts, hit_ts, score, _ in hits:
             results.append({"file": vname, "timestamp": hit_ts,
                             "type": "hit", "score": round(score, 1),
                             "shot_ts": shot_ts})
@@ -450,7 +480,10 @@ def cmd_detect(video_dir, detect_type="both"):
         json.dump(results, f, indent=2)
 
     print(f"\n{'='*50}")
-    print(f"Shots: {total_shots}  |  Hits: {total_hits}  |  Misses: {total_misses}")
+    n_targets = targets if targets is not None else total_shots
+    print(f"{total_hits}/{total_shots} out of {n_targets}")
+    print(f"Shots: {total_shots}  |  Hits: {total_hits}  |  "
+          f"Misses: {total_misses}")
     print(f"Written to {hits_path}")
     print()
     print("Next steps:")
@@ -753,6 +786,19 @@ def main():
         help="detection type: shot (audio), hit (visual), or both (default)",
     )
     parser.add_argument(
+        "--clay-type",
+        choices=["away", "coming", "left", "right"],
+        default="away",
+        help="clay flight type; selects the hit/miss detector "
+             "(default: away).",
+    )
+    parser.add_argument(
+        "--targets", type=int, default=None,
+        help="total number of clays thrown across the analyzed videos. "
+             "Used only for the summary line; defaults to the number "
+             "of detected shots.",
+    )
+    parser.add_argument(
         "--sfx", action="store_true",
         help="replace gunshot audio with a video-game-style sound effect",
     )
@@ -767,12 +813,14 @@ def main():
     video_dir = os.path.abspath(args.video_dir)
 
     if args.command == "detect":
-        cmd_detect(video_dir, detect_type=args.type)
+        cmd_detect(video_dir, detect_type=args.type,
+                   clay_type=args.clay_type, targets=args.targets)
     elif args.command == "compile":
         cmd_compile(video_dir, merge=args.merge, overlay=args.overlay,
                     sfx=args.sfx)
     else:
-        cmd_detect(video_dir, detect_type=args.type)
+        cmd_detect(video_dir, detect_type=args.type,
+                   clay_type=args.clay_type, targets=args.targets)
         print()
         cmd_compile(video_dir, merge=args.merge, overlay=args.overlay,
                     sfx=args.sfx)
