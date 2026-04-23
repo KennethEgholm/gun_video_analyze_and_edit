@@ -42,12 +42,14 @@ Writes a `hits.json` file with detected entries:
 
 ```json
 [
-  { "file": "SHOT0001.MP4", "timestamp": 5.38, "type": "shot" },
-  { "file": "SHOT0001.MP4", "timestamp": 8.96, "type": "hit" }
+  { "file": "SHOT0001.MP4", "timestamp": 5.81, "type": "shot",
+    "outcome": "hit", "hit_score": 39.3 },
+  { "file": "SHOT0001.MP4", "timestamp": 6.39, "type": "hit",
+    "score": 39.3, "shot_ts": 5.81 }
 ]
 ```
 
-Each entry has a `type` field: `"shot"` for audio-detected gunshots, `"hit"` for visually-detected clay target breaks.
+Each `shot` entry is annotated with its `outcome` (`"hit"` or `"miss"`) and `hit_score`. A separate `hit` entry is added for every shot classified as a hit, so the compile step picks up clay-break clips automatically.
 
 **2. Review and edit**
 
@@ -83,13 +85,6 @@ All compile flags can be combined. The video directory defaults to the current d
 
 ## How detection works
 
-### Visual hit detection
-
-1. Each video is downscaled to 320px wide grayscale for fast analysis.
-2. Frame-to-frame pixel differences are computed. A clay hit produces a sharp spike in this signal due to the sudden burst of fragments.
-3. Spikes above 3 standard deviations from the mean are flagged as candidates.
-4. Candidates where the frame brightness is well below average are rejected -- this filters out false positives from lowering the gun toward the ground after a shot.
-
 ### Audio shot detection
 
 1. Raw PCM audio is extracted from each video via FFmpeg.
@@ -98,11 +93,25 @@ All compile flags can be combined. The video directory defaults to the current d
 4. Candidates with peak RMS below 18000 are rejected -- this filters out the gun break-open sound, which is loud enough to spike the energy envelope but has lower sustained energy than an actual gunshot.
 5. Spikes within 0.5 seconds are clustered, with the peak energy window selected as the shot timestamp.
 
+### Visual hit/miss classification (per shot)
+
+Triggered by each detected audio shot:
+
+1. The video is downscaled to 320px wide grayscale and divided into a 16x9 block grid.
+2. A reference frame is built from the **immediate post-shot window** ([shot+50ms, shot+150ms]) — by then the camera has settled into recoil pose, so this is a good "shot just fired, nothing else changed yet" baseline.
+3. Block-level absolute differences are computed for the **clay-break window** ([shot+200ms, shot+600ms]) versus the reference. A clay break / dust puff appears as a sustained brightness change in this window.
+4. Per-block peak diff is taken, restricted to the **upper ~55% of the frame** (where clays and the hill ridge are). The bottom rows are ignored because the camera typically follows through downward after a miss, generating large but irrelevant changes there.
+5. A shot is classified as a **hit** when the peak block diff, the peak/median ratio, and the size of the high-diff cluster all clear thresholds (see `HIT_*` constants in `detect_hits.py`).
+
+Each entry in `hits.json` includes a numeric `score` (`hit_score` for shots, `score` for the corresponding hit) so you can review borderline cases and tune thresholds for your own footage.
+
 ## Limitations
 
-- The visual hit detector cannot distinguish a hit from a close miss where the shot produces a visible smoke puff. Review `hits.json` to catch these.
-- Audio shot detection requires the video to have an audio track. Videos without audio will only produce visual hit detections.
-- Expects filenames matching `SHOT*.MP4`. Rename files or adjust the glob pattern in the script if needed.
+- Hit/miss classification is conditioned on each detected audio shot. If a shot is missed by the audio detector, no hit/miss decision is made for it.
+- The visual classifier assumes the targets/hill are in the upper portion of the frame. Footage where the action is in the bottom half (e.g. ground-level clays, very low gun mount) will need the `HIT_UPPER_FRACTION` constant adjusted.
+- Audio shot detection requires the video to have an audio track. Videos without audio cannot be analyzed.
+- Expects filenames matching `SHOT*.MP4` (case-insensitive). Rename files or adjust the glob pattern in the script if needed.
+- Borderline scores in `hits.json` are worth reviewing; you can edit `outcome` or remove false-positive `hit` entries before running compile.
 
 ## Shot Analysis Tool
 

@@ -49,6 +49,19 @@ AUDIO_MIN_SPIKE_SEPARATION_SEC = 0.5
 AUDIO_MIN_PEAK_RMS = 18000          # reject transients below this RMS (e.g. gun break-open)
 MERGE_MAX_GAP_SEC = 5.0             # max gap between entries before splitting a merged clip
 
+# Patch-based clay-break detection (per audio shot)
+HIT_GRID_X = 16                  # block grid width
+HIT_GRID_Y = 9                   # block grid height
+HIT_REF_LO_SEC = 0.05            # reference window starts this far after shot
+HIT_REF_HI_SEC = 0.15            # reference window ends this far after shot
+HIT_LOOK_LO_SEC = 0.20           # look for dust/break this far after shot
+HIT_LOOK_HI_SEC = 0.60           # ... up to this far after shot
+HIT_PEAK_MIN = 27.0              # min per-block peak diff vs reference
+HIT_CLUSTER_MIN = 2              # min size of high-diff cluster (blocks)
+HIT_UPPER_FRACTION = 5 / 9       # only score the top 5/9 of the frame
+                                 # (clays/hill); bottom rows fire on
+                                 # camera follow-through after misses
+
 
 def check_dependencies():
     """Verify required external tools are installed; exit with a friendly
@@ -242,6 +255,99 @@ def find_gunshots(energy, samples=None, window_ms=AUDIO_WINDOW_MS,
     return results
 
 
+# -- patch-based clay-break detection (per audio shot) -----------------------
+
+def compute_block_frames(path, gx=HIT_GRID_X, gy=HIT_GRID_Y,
+                         analysis_width=ANALYSIS_WIDTH):
+    """Load video as grayscale, return per-block-mean frames (N, gy, gx) and fps.
+
+    Used for clay-break detection: look for a localized brightness change in
+    the post-shot window vs a reference frame just after the shot.
+    """
+    duration, fps = get_video_info(path)
+    info = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", path],
+        capture_output=True, text=True,
+    )
+    stream = json.loads(info.stdout)["streams"][0]
+    orig_w, orig_h = int(stream["width"]), int(stream["height"])
+    ah = int(analysis_width * orig_h / orig_w)
+    ah += ah % 2
+
+    cmd = ["ffmpeg", "-i", path,
+           "-vf", f"scale={analysis_width}:-2,format=gray",
+           "-f", "rawvideo", "-pix_fmt", "gray", "-v", "quiet", "-"]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    raw = proc.stdout.read()
+    proc.wait()
+
+    fs = analysis_width * ah
+    n = len(raw) // fs
+    if n < 2:
+        return np.empty((0, gy, gx), dtype=np.float64), fps
+
+    frames = np.frombuffer(raw[:n * fs], dtype=np.uint8) \
+        .reshape(n, ah, analysis_width).astype(np.int16)
+    bw, bh = analysis_width // gx, ah // gy
+    cropped = frames[:, :bh * gy, :bw * gx]
+    blocks = cropped.reshape(n, gy, bh, gx, bw).mean(axis=(2, 4))
+    return blocks, fps
+
+
+def classify_shot_as_hit(block_frames, fps, shot_ts):
+    """Decide if an audio-detected shot was a hit (clay break visible).
+
+    Algorithm: take a reference of the immediate post-shot frames (camera
+    has just settled into recoil pose), then look 200-600ms later for a
+    LOCALIZED brightness change in the upper portion of the frame. A clay
+    break/dust puff produces such a change; a clean miss does not.
+
+    Returns dict with: is_hit, score (peak block diff), ratio (peak/median),
+    cluster (count of blocks above 0.5*peak), hit_ts (shot_ts + offset of peak).
+    """
+    n = len(block_frames)
+    if n == 0:
+        return None
+    gy, gx = block_frames.shape[1], block_frames.shape[2]
+
+    ra = max(0, int((shot_ts + HIT_REF_LO_SEC) * fps))
+    rb = min(n, max(ra + 1, int((shot_ts + HIT_REF_HI_SEC) * fps)))
+    la = max(rb, int((shot_ts + HIT_LOOK_LO_SEC) * fps))
+    lb = min(n, int((shot_ts + HIT_LOOK_HI_SEC) * fps))
+    if rb <= ra or lb <= la:
+        return {"is_hit": False, "score": 0.0, "ratio": 0.0,
+                "cluster": 0, "hit_ts": None}
+
+    ref = block_frames[ra:rb].mean(axis=0)
+    look = block_frames[la:lb]
+    diff = np.abs(look - ref)             # (T, gy, gx)
+    block_peak = diff.max(axis=0)         # (gy, gx)
+
+    # Score only the upper portion (where clays appear); the bottom rows
+    # tend to fire on camera follow-through after a miss.
+    upper_rows = max(1, int(round(gy * HIT_UPPER_FRACTION)))
+    upper = block_peak[:upper_rows]
+
+    score = float(upper.max())
+    median = float(np.median(upper))
+    ratio = score / max(median, 0.5)
+    cluster = int((upper > 0.5 * score).sum())
+
+    is_hit = (score >= HIT_PEAK_MIN and cluster >= HIT_CLUSTER_MIN)
+
+    # Find the frame inside the look window where peak block was hottest.
+    if is_hit:
+        peak_block = np.unravel_index(int(upper.argmax()), upper.shape)
+        per_frame_at_peak = diff[:, peak_block[0], peak_block[1]]
+        peak_offset_frames = int(per_frame_at_peak.argmax())
+        hit_ts = round(shot_ts + HIT_LOOK_LO_SEC + peak_offset_frames / fps, 2)
+    else:
+        hit_ts = None
+
+    return {"is_hit": is_hit, "score": score, "ratio": ratio,
+            "cluster": cluster, "hit_ts": hit_ts}
+
+
 # -- detect command -----------------------------------------------------------
 
 def cmd_detect(video_dir, detect_type="both"):
@@ -266,22 +372,16 @@ def cmd_detect(video_dir, detect_type="both"):
     results = []
     total_hits = 0
     total_shots = 0
-    total_rejected = 0
+    total_misses = 0
 
     for i, vpath in enumerate(video_files):
         vname = os.path.basename(vpath)
         sys.stdout.write(f"[{i+1}/{len(video_files)}] {vname}")
         sys.stdout.flush()
 
-        hits = []
-        rejects = []
         shots = []
-
-        if do_hits:
-            full, bright, fps, duration = analyze_video(vpath)
-            detections = find_hits(full, bright, fps)
-            hits = [(t, r) for t, label, r in detections if label == "HIT"]
-            rejects = [(t, r) for t, label, r in detections if label == "REJECT"]
+        hits = []           # (shot_ts, hit_ts, score)
+        misses = []         # (shot_ts, score)
 
         if do_shots:
             audio_samples = extract_audio(vpath)
@@ -289,13 +389,31 @@ def cmd_detect(video_dir, detect_type="both"):
             audio_detections = find_gunshots(energy, samples=audio_samples)
             shots = [(t, r) for t, label, r in audio_detections if label == "SHOT"]
 
+        if do_hits and shots:
+            # Patch-based hit/miss test conditioned on each detected shot.
+            block_frames, fps = compute_block_frames(vpath)
+            for shot_ts, _ in shots:
+                res = classify_shot_as_hit(block_frames, fps, shot_ts)
+                if res is None:
+                    continue
+                if res["is_hit"]:
+                    hits.append((shot_ts, res["hit_ts"], res["score"]))
+                else:
+                    misses.append((shot_ts, res["score"]))
+        elif do_hits and not do_shots:
+            print(" -> WARNING: --type hit needs shot context; "
+                  "use --type both")
+
         parts = []
         if shots:
-            parts.append(f"{len(shots)} shot(s) at {[f'{t:.1f}s' for t, _ in shots]}")
+            parts.append(f"{len(shots)} shot(s) at "
+                         f"{[f'{t:.1f}s' for t, _ in shots]}")
         if hits:
-            parts.append(f"{len(hits)} hit(s) at {[f'{t:.1f}s' for t, _ in hits]}")
-        if rejects:
-            parts.append(f"{len(rejects)} rejected: {[f'{t:.1f}s ({r})' for t, r in rejects]}")
+            parts.append(f"{len(hits)} hit(s) at "
+                         f"{[f'{ht:.1f}s(score={s:.0f})' for _, ht, s in hits]}")
+        if misses:
+            parts.append(f"{len(misses)} miss(es) at "
+                         f"{[f'{st:.1f}s(score={s:.0f})' for st, s in misses]}")
         if parts:
             print(f" -> {'; '.join(parts)}")
         else:
@@ -303,12 +421,27 @@ def cmd_detect(video_dir, detect_type="both"):
 
         total_hits += len(hits)
         total_shots += len(shots)
-        total_rejected += len(rejects)
+        total_misses += len(misses)
 
-        for ts, _ in shots:
-            results.append({"file": vname, "timestamp": ts, "type": "shot"})
-        for ts, _ in hits:
-            results.append({"file": vname, "timestamp": ts, "type": "hit"})
+        for shot_ts, _ in shots:
+            entry = {"file": vname, "timestamp": shot_ts, "type": "shot"}
+            # Tag with its hit/miss outcome for downstream analysis.
+            for st, ht, sc in hits:
+                if st == shot_ts:
+                    entry["outcome"] = "hit"
+                    entry["hit_score"] = round(sc, 1)
+                    break
+            else:
+                for st, sc in misses:
+                    if st == shot_ts:
+                        entry["outcome"] = "miss"
+                        entry["hit_score"] = round(sc, 1)
+                        break
+            results.append(entry)
+        for shot_ts, hit_ts, score in hits:
+            results.append({"file": vname, "timestamp": hit_ts,
+                            "type": "hit", "score": round(score, 1),
+                            "shot_ts": shot_ts})
 
     results.sort(key=lambda r: (r["file"], r["timestamp"]))
 
@@ -317,7 +450,7 @@ def cmd_detect(video_dir, detect_type="both"):
         json.dump(results, f, indent=2)
 
     print(f"\n{'='*50}")
-    print(f"Shots: {total_shots}  |  Hits: {total_hits}  |  Rejected: {total_rejected}")
+    print(f"Shots: {total_shots}  |  Hits: {total_hits}  |  Misses: {total_misses}")
     print(f"Written to {hits_path}")
     print()
     print("Next steps:")
