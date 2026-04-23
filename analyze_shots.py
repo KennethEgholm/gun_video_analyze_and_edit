@@ -28,6 +28,8 @@ from detect_hits import (
     get_video_info,
     extract_audio,
     compute_audio_energy,
+    check_dependencies,
+    cmd_detect,
     ANALYSIS_WIDTH,
     AUDIO_SAMPLE_RATE,
     AUDIO_WINDOW_MS,
@@ -50,7 +52,10 @@ LABELS_FILE = "labels.json"
 def load_hits_json(video_dir):
     path = os.path.join(video_dir, HITS_FILE)
     if not os.path.exists(path):
-        print(f"No {path} found. Run: python3 detect_hits.py detect --type both {video_dir}")
+        print(f"No {path} found.")
+        print("Run one of:")
+        print(f"  python3 detect_hits.py detect --type both {video_dir}")
+        print(f"  python3 analyze_shots.py all {video_dir}   # full pipeline")
         sys.exit(1)
     with open(path) as f:
         return json.load(f)
@@ -504,6 +509,8 @@ def print_report(all_features, stats, per_miss_notes, file=None):
         out(f"  {s['label']:<30} {h_str:>18} {m_str:>18} {s['cohens_d']:>+7.2f} {effect}")
 
     out(f"\n  Effect size: |d|>0.8=*** 0.5-0.8=** 0.2-0.5=* <0.2=(ns)")
+    out("  (Cohen's d measures how strongly a signal separates hits from")
+    out("   misses. Larger |d| = bigger difference; sign shows direction.)")
 
     # Top factors
     out(f"\n{'='*72}")
@@ -756,28 +763,63 @@ def main():
     parser = argparse.ArgumentParser(
         description="Analyze hit vs miss patterns in clay target shooting videos.",
         epilog="Workflow:\n"
-               "  1. python3 detect_hits.py detect --type both /path/to/videos\n"
-               "  2. python3 analyze_shots.py label /path/to/videos\n"
-               "     (edit labels.json to correct any misclassifications)\n"
-               "  3. python3 analyze_shots.py /path/to/videos\n",
+               "  Quick (one command):\n"
+               "    python3 analyze_shots.py all /path/to/videos\n"
+               "\n"
+               "  Step-by-step (recommended for accuracy):\n"
+               "    1. python3 detect_hits.py detect --type both /path/to/videos\n"
+               "    2. python3 analyze_shots.py label /path/to/videos\n"
+               "       (edit labels.json to correct any misclassifications)\n"
+               "    3. python3 analyze_shots.py /path/to/videos\n",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("command", nargs="?", default=None,
-                        help="label (generate labels.json) or omit to analyze")
+                        help="'label' to generate labels.json, "
+                             "'all' to run the full pipeline, "
+                             "or omit to analyze")
     parser.add_argument("video_dir", nargs="?", default=".",
                         help="Directory with SHOT*.MP4 and hits.json (default: .)")
     args = parser.parse_args()
 
     # Handle ambiguity: if command looks like a path, treat as video_dir
-    if args.command and args.command != "label":
+    if args.command and args.command not in ("label", "all"):
         args.video_dir = args.command
         args.command = None
 
+    check_dependencies()
     video_dir = os.path.abspath(args.video_dir)
+
+    if not os.path.isdir(video_dir):
+        print(f"Error: {video_dir} is not a directory.")
+        sys.exit(1)
 
     if args.command == "label":
         cmd_label(video_dir)
         return
+
+    if args.command == "all":
+        # Full pipeline: detect -> label -> analyze (using auto-labels).
+        hits_path = os.path.join(video_dir, HITS_FILE)
+        if not os.path.exists(hits_path):
+            print(f"Step 1/3: detecting shots and hits in {video_dir}\n")
+            cmd_detect(video_dir, detect_type="both")
+            print()
+        else:
+            print(f"Step 1/3: skipping detection ({HITS_FILE} already exists)\n")
+
+        labels_path = os.path.join(video_dir, LABELS_FILE)
+        if not os.path.exists(labels_path):
+            print(f"Step 2/3: generating {LABELS_FILE}\n")
+            cmd_label(video_dir)
+            print()
+            print(f"  Tip: edit {labels_path} to correct hit/miss labels,")
+            print(f"       then re-run:  python3 {sys.argv[0]} {video_dir}")
+            print()
+        else:
+            print(f"Step 2/3: skipping label generation ({LABELS_FILE} already exists)\n")
+
+        print("Step 3/3: running analysis\n")
+        # fall through to analysis below
 
     # Load classifications: use labels.json if it exists, otherwise auto-detect
     labels_path = os.path.join(video_dir, LABELS_FILE)

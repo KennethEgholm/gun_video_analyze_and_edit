@@ -22,6 +22,7 @@ Detection strategies:
 """
 
 import argparse
+import shutil
 import subprocess
 import sys
 import os
@@ -49,12 +50,27 @@ AUDIO_MIN_PEAK_RMS = 18000          # reject transients below this RMS (e.g. gun
 MERGE_MAX_GAP_SEC = 5.0             # max gap between entries before splitting a merged clip
 
 
+def check_dependencies():
+    """Verify required external tools are installed; exit with a friendly
+    message if not."""
+    missing = [tool for tool in ("ffmpeg", "ffprobe") if shutil.which(tool) is None]
+    if missing:
+        print(f"Error: required tool(s) not found on PATH: {', '.join(missing)}")
+        print("Install FFmpeg, e.g. on macOS:  brew install ffmpeg")
+        sys.exit(1)
+
+
 def get_video_info(path):
     result = subprocess.run(
         ["ffprobe", "-v", "quiet", "-print_format", "json",
          "-show_format", "-show_streams", path],
         capture_output=True, text=True
     )
+    if result.returncode != 0 or not result.stdout.strip():
+        print(f"Error: ffprobe failed to read {path}")
+        if result.stderr:
+            print(result.stderr.strip())
+        sys.exit(1)
     data = json.loads(result.stdout)
     duration = float(data["format"]["duration"])
     stream = data["streams"][0]
@@ -229,9 +245,17 @@ def find_gunshots(energy, samples=None, window_ms=AUDIO_WINDOW_MS,
 # -- detect command -----------------------------------------------------------
 
 def cmd_detect(video_dir, detect_type="both"):
-    video_files = sorted(glob.glob(os.path.join(video_dir, "SHOT*.MP4")))
+    if not os.path.isdir(video_dir):
+        print(f"Error: {video_dir} is not a directory.")
+        sys.exit(1)
+
+    video_files = sorted(
+        glob.glob(os.path.join(video_dir, "SHOT*.MP4"))
+        + glob.glob(os.path.join(video_dir, "SHOT*.mp4"))
+    )
     if not video_files:
         print(f"No SHOT*.MP4 files found in {video_dir}")
+        print("Hint: filenames must start with 'SHOT' and end in .MP4 / .mp4.")
         sys.exit(1)
 
     do_hits = detect_type in ("hit", "both")
@@ -295,7 +319,12 @@ def cmd_detect(video_dir, detect_type="both"):
     print(f"\n{'='*50}")
     print(f"Shots: {total_shots}  |  Hits: {total_hits}  |  Rejected: {total_rejected}")
     print(f"Written to {hits_path}")
-    print(f"Review and edit the file, then run: python3 {sys.argv[0]} compile")
+    print()
+    print("Next steps:")
+    print(f"  - Review/edit {HITS_FILE} to remove false positives, then:")
+    print(f"      python3 {sys.argv[0]} compile {video_dir}    # build highlight reel")
+    if total_shots > 0:
+        print(f"      python3 analyze_shots.py label {video_dir}   # hit/miss analysis")
 
 
 def _generate_sfx(path, sample_rate=44100):
@@ -601,6 +630,7 @@ def main():
         args.video_dir = args.command
         args.command = None
 
+    check_dependencies()
     video_dir = os.path.abspath(args.video_dir)
 
     if args.command == "detect":

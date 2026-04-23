@@ -4,12 +4,12 @@ Automatically detects clay target hits and shots fired in shotgun-mounted camera
 
 ## Requirements
 
-- Python 3 with NumPy
-- FFmpeg
+- Python 3 with NumPy, Matplotlib, Pillow
+- FFmpeg (provides `ffmpeg` and `ffprobe`)
 
 ```bash
 brew install ffmpeg
-pip install numpy
+pip install -r requirements.txt
 ```
 
 ## Usage
@@ -109,6 +109,16 @@ All compile flags can be combined. The video directory defaults to the current d
 Compares hit vs miss patterns to find what the shooter does differently when missing.
 
 ### Workflow
+
+**Quick start (one command):**
+
+```bash
+python3 analyze_shots.py all /path/to/videos
+```
+
+This runs detection, generates `labels.json`, and produces the analysis report. It skips any step whose output already exists, so re-running after editing `labels.json` is safe.
+
+**Step-by-step (recommended for accurate hit/miss labeling):**
 
 **1. Detect shots and hits:**
 
