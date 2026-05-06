@@ -50,6 +50,12 @@ python3 detect_shots.py compile /path/to/videos
 
 Reads `shots.json` and produces `shots_compilation.mp4` with a 1.5 second clip per entry (0.5s before, 1.0s after), with audio included.
 
+Use `--pre` and `--post` to override the lead and trail times (in seconds):
+
+```bash
+python3 detect_shots.py compile --pre 1.0 --post 2.0 /path/to/videos
+```
+
 Use `--merge` to combine multiple shots from the same file into one continuous clip (splits when the gap exceeds 5 seconds):
 
 ```bash

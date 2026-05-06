@@ -25,8 +25,8 @@ import numpy as np
 
 SHOTS_FILE = "shots.json"
 OUTPUT_FILE = "shots_compilation.mp4"
-CLIP_DURATION = 1.5
-CLIP_PRE = 0.5
+CLIP_PRE = 0.5         # default seconds before each shot
+CLIP_POST = 1.0        # default seconds after each shot
 
 # Audio gunshot detection
 AUDIO_SAMPLE_RATE = 16000
@@ -253,7 +253,8 @@ def _make_overlay(filename, start_sec, out_path, width=1920, height=1080):
 
 # -- compile command ----------------------------------------------------------
 
-def cmd_compile(video_dir, merge=False, overlay=False, sfx=False):
+def cmd_compile(video_dir, merge=False, overlay=False, sfx=False,
+                pre=CLIP_PRE, post=CLIP_POST):
     shots_path = os.path.join(video_dir, SHOTS_FILE)
     if not os.path.exists(shots_path):
         print(f"No {shots_path} found. Run detect first:")
@@ -316,8 +317,8 @@ def cmd_compile(video_dir, merge=False, overlay=False, sfx=False):
             continue
 
         duration, _ = get_video_info(vpath)
-        start = max(0, clip["start_ts"] - CLIP_PRE)
-        clip_len = (clip["end_ts"] - clip["start_ts"]) + CLIP_DURATION
+        start = max(0, clip["start_ts"] - pre)
+        clip_len = (clip["end_ts"] - clip["start_ts"]) + pre + post
         if start + clip_len > duration:
             clip_len = duration - start
 
@@ -475,6 +476,14 @@ def main():
         "--sfx", action="store_true",
         help="replace gunshot audio with a video-game-style sound effect",
     )
+    parser.add_argument(
+        "--pre", type=float, default=CLIP_PRE,
+        help=f"seconds of lead before each shot (default: {CLIP_PRE})",
+    )
+    parser.add_argument(
+        "--post", type=float, default=CLIP_POST,
+        help=f"seconds of trail after each shot (default: {CLIP_POST})",
+    )
     args = parser.parse_args()
 
     if args.command and args.command not in ("detect", "compile"):
@@ -488,12 +497,12 @@ def main():
         cmd_detect(video_dir)
     elif args.command == "compile":
         cmd_compile(video_dir, merge=args.merge, overlay=args.overlay,
-                    sfx=args.sfx)
+                    sfx=args.sfx, pre=args.pre, post=args.post)
     else:
         cmd_detect(video_dir)
         print()
         cmd_compile(video_dir, merge=args.merge, overlay=args.overlay,
-                    sfx=args.sfx)
+                    sfx=args.sfx, pre=args.pre, post=args.post)
 
 
 if __name__ == "__main__":
