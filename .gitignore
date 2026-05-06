@@ -1,7 +1,4 @@
 .DS_Store
-hits.json
-labels.json
-debug_frames/
+shots.json
 .claude/
-analysis/
 videos/
